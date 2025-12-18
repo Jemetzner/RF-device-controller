@@ -1,154 +1,179 @@
-"""
-Instrument control utilities for mode-splitting experiments.
-
-This module provides simple wrappers around:
-- Rhode & Schwarz SMC100A signal generator
-- Tektronix DPO2012 oscilloscope
-
-It uses PyVISA for communication.
-"""
-
-from __future__ import annotations
-
-from typing import Optional
-
+#!/usr/bin/env python3
+import argparse
+import time
+import numpy as np
+import matplotlib.pyplot as plt
 import pyvisa
+import dwfpy as dwf
 
+# -------------------- Signal Generator --------------------
+class SMC100A:
+    def __init__(self, resource):
+        self.rm = pyvisa.ResourceManager()
+        self.inst = self.rm.open_resource(resource)
+        self.inst.timeout = 10000
+        self.inst.write_termination = "\n"
+        self.inst.read_termination = "\n"
+        print("Connected to:", self.inst.query("*IDN?"))
 
-class SignalGeneratorSMC100A:
-    """Simple wrapper for R&S SMC100A signal generator via VISA.
+    def set_freq(self, hz):
+        self.inst.write(f"SOUR:FREQ {hz}")
 
-    Parameters
-    ----------
-    resource : str
-        VISA resource string, e.g. "TCPIP0::192.168.1.100::inst0::INSTR"
-        or "GPIB0::10::INSTR".
-    rm : Optional[pyvisa.ResourceManager]
-        Existing ResourceManager to reuse; if None, a new one is created.
-    """
+    def set_power(self, dbm):
+        self.inst.write(f"SOUR:POW:POW {dbm}")
 
-    def __init__(self, resource: str, rm: Optional[pyvisa.ResourceManager] = None) -> None:
-        self._rm = rm or pyvisa.ResourceManager()
-        self._inst = self._rm.open_resource(resource)
-        # Reasonable default timeout (ms)
-        self._inst.timeout = 5000
-        # Enable RF output by default
-        self._inst.write("OUTP:STATE ON")
+    def rf_on(self):
+        self.inst.write("OUTP ON")
 
-    def set_frequency_and_amplitude(self, frequency_hz: float, amplitude_vrms: float) -> None:
-        """Set RF frequency (Hz) and output amplitude (V RMS).
+    def rf_off(self):
+        self.inst.write("OUTP OFF")
 
-        Adjust units here if your lab prefers dBm or Vpp.
-        """
-        # Frequency
-        self._inst.write(f"FREQ {frequency_hz}")
-        # Amplitude in VRMS (change to VPP or DBM if desired)
-        self._inst.write("SOUR:POW:UNIT VRMS")
-        self._inst.write(f"SOUR:VOLT {amplitude_vrms}")
-
-    def close(self) -> None:
-        """Close the VISA session for this generator."""
+    def close(self):
         try:
-            self._inst.close()
-        except Exception:
-            # Best-effort close; ignore I/O errors on shutdown
-            pass
+            self.rf_off()
+        finally:
+            self.inst.close()
+
+# -------------------- Oscilloscope --------------------
+class DigilentScope:
+    def __init__(self, channels=[1]):
+        self.channels = [ch - 1 for ch in channels]  # 0-indexed
+        self.device = dwf.Device()
+        self.device.open()
+        self.ai = self.device.analog_input
+        self.sample_rate = None
+        self.buffer_size = None
+
+        for idx in self.channels:
+            ch = self.ai[idx]
+            ch.enabled = True
+            ch.range = 5.0
+            ch.offset = 0.0
+
+    def configure_channel(self, channel=1, v_range=5.0, offset=0.0):
+        idx = channel - 1
+        ch = self.ai[idx]
+        ch.enabled = True
+        ch.range = v_range
+        ch.offset = offset
+
+    def set_timebase(self, sample_rate, buffer_size):
+        self.sample_rate = sample_rate
+        self.buffer_size = buffer_size
+        self.ai.record_length = buffer_size
+        self.ai.sampling_rate = sample_rate
+
+    def _wait_for_completion(self, timeout=2.0):
+        t0 = time.time()
+        while True:
+            status = self.ai.read_status(read_data=True)
+            if status in (0, 2):  # Done or Prefill
+                break
+            if time.time() - t0 > timeout:
+                raise TimeoutError("Acquisition did not complete in time")
+            time.sleep(0.001)
+
+    def get_waveform(self, channel=1, timeout=2.0):
+        idx = channel - 1
+        if self.sample_rate is None or self.buffer_size is None:
+            raise ValueError("Sample rate and buffer size must be set before acquisition")
+        self.ai.trigger_source = "none"
+        self.ai.single(configure=True, start=True)
+        self._wait_for_completion(timeout=timeout)
+        samples = np.array(self.ai[idx].get_data())
+        return samples
+
+    def get_peak_to_peak(self, channel=1, timeout=2.0):
+        data = self.get_waveform(channel, timeout=timeout)
+        return np.max(data) - np.min(data)
+
+    def close(self):
+        self.device.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
 
-class OscilloscopeDPO2012:
-    """Minimal Tektronix DPO2012 wrapper.
+# -------------------- Sweep Script --------------------
+def run_sweep(sg_resource, f_start, f_stop, n_points=50, channel=1, output_file="sweep.csv"):
+    # Connect instruments
+    sg = SMC100A(sg_resource)
+    scope = DigilentScope(channels=[channel])
+    scope.configure_channel(channel=channel, v_range=5.0, offset=0.0)
 
-    Provides channel peak-to-peak reading and automatic time scale update
-    based on the signal generator frequency.
-    """
+    frequencies = np.logspace(np.log10(f_start), np.log10(f_stop), n_points)
+    vpp_results = []
 
-    def __init__(self, resource: str, rm: Optional[pyvisa.ResourceManager] = None) -> None:
-        self._rm = rm or pyvisa.ResourceManager()
-        self._inst = self._rm.open_resource(resource)
-        self._inst.timeout = 5000
-        # Use ASCII for simplicity
-        self._inst.write("DATA:ENC ASCIi")
-
-    def set_time_scale_from_frequency(self, frequency_hz: float, periods_on_screen: float = 5.0) -> None:
-        """Set horizontal scale such that ~periods_on_screen periods span 10 divisions.
-
-        Tektronix horizontal scale is seconds per division; there are 10 horizontal divisions.
-
-        time_scale = (periods_on_screen / 10) * (1 / frequency_hz)
-        """
-        if frequency_hz <= 0:
-            raise ValueError("frequency_hz must be > 0")
-        period = 1.0 / frequency_hz
-        time_scale = (periods_on_screen / 10.0) * period
-        self._inst.write(f"HOR:MAIN:SCA {time_scale}")
-
-    def measure_vpp(self, channel: int = 1) -> float:
-        """Return peak-to-peak voltage for a given channel.
-
-        Uses the oscilloscope's built-in measurement system.
-        """
-        if channel not in (1, 2):
-            raise ValueError("DPO2012 has channels 1 and 2")
-
-        # Configure immediate measurement for peak-to-peak on the selected channel
-        self._inst.write(f"MEASU:IMM:SOU CH{channel}")
-        self._inst.write("MEASU:IMM:TYPE PK2PK")
-        vpp_str = self._inst.query("MEASU:IMM:VAL?")
-
-        try:
-            return float(vpp_str)
-        except ValueError as exc:
-            raise RuntimeError(f"Could not parse Vpp reading from scope: {vpp_str!r}") from exc
-
-    def close(self) -> None:
-        """Close the VISA session for this scope."""
-        try:
-            self._inst.close()
-        except Exception:
-            pass
+    sg.rf_on()
+    try:
+        for f in frequencies:
+            sg.set_freq(f)
 
 
-class ModeSplittingInstruments:
-    """Convenience wrapper tying the generator to the scope.
+            # Timebase: capture ~10 periods on 5000 points
+            period = 1.0 / f
+            n_cycles = 10
+            display_time = period * n_cycles
+            buffer_size = 5000
+            sample_rate = buffer_size / display_time
+            scope.set_timebase(sample_rate=sample_rate, buffer_size=buffer_size)
 
-    On each frequency change, the scope time scale is adjusted automatically.
-    """
+            # Small delay to let instruments settle
+            time.sleep(0.01)
 
-    def __init__(
-        self,
-        sig_gen_resource: str,
-        scope_resource: str,
-        rm: Optional[pyvisa.ResourceManager] = None,
-    ) -> None:
-        self._rm = rm or pyvisa.ResourceManager()
-        self.sig_gen = SignalGeneratorSMC100A(sig_gen_resource, rm=self._rm)
-        self.scope = OscilloscopeDPO2012(scope_resource, rm=self._rm)
+            # Acquire Vpp
+            try:
+                vpp = scope.get_peak_to_peak(channel=channel, timeout=2.0)
+            except Exception as e:
+                print(f"Error at {f/1e6:.3f} MHz: {e}")
+                vpp = np.nan
+            vpp_results.append(vpp)
+            print(f"Freq: {f/1e6:.3f} MHz -> Vpp: {vpp:.3f} V")
 
-    def set_frequency_and_amplitude(
-        self,
-        frequency_hz: float,
-        amplitude_vrms: float,
-        *,
-        periods_on_screen: float = 5.0,
-    ) -> None:
-        """Set generator frequency and amplitude, then retune scope time scale."""
-        self.sig_gen.set_frequency_and_amplitude(frequency_hz, amplitude_vrms)
-        self.scope.set_time_scale_from_frequency(frequency_hz, periods_on_screen=periods_on_screen)
+    finally:
+        sg.rf_off()
+        sg.close()
+        scope.close()
 
-    def measure_vpp(self, channel: int = 1) -> float:
-        """Return peak-to-peak voltage on the chosen scope channel."""
-        return self.scope.measure_vpp(channel=channel)
+    # Save results
+    data = np.column_stack((frequencies, vpp_results))
+    np.savetxt(output_file, data, delimiter=",", header="Frequency(Hz),Vpp(V)", comments="")
+    print(f"Data saved to {output_file}")
 
-    def close(self) -> None:
-        """Close both instruments."""
-        self.sig_gen.close()
-        self.scope.close()
-
-
-__all__ = [
-    "SignalGeneratorSMC100A",
-    "OscilloscopeDPO2012",
-    "ModeSplittingInstruments",
-]
+    # Plot
+    plt.figure()
+    plt.semilogx(frequencies, vpp_results, marker="o")
+    plt.xlabel("Frequency [Hz]")
+    plt.ylabel("Vpp [V]")
+    plt.title("Frequency Sweep")
+    plt.grid(True, which="both")
+    plt.show()
 
 
+# -------------------- Command-line interface --------------------
+if __name__ == "__main__":
+
+    # parser = argparse.ArgumentParser(description="Frequency sweep using SMC100A + Digilent scope")
+    # parser.add_argument("--sg", type=str, required=True, help="Signal generator VISA resource string")
+    # parser.add_argument("--fstart", type=float, default=9e3, help="Start frequency (Hz)")
+    # parser.add_argument("--fstop", type=float, default=100e6, help="Stop frequency (Hz)")
+    # parser.add_argument("--npoints", type=int, default=50, help="Number of points in sweep")
+    # parser.add_argument("--channel", type=int, default=1, help="Scope channel to measure")
+    # parser.add_argument("--outfile", type=str, default="sweep.csv", help="CSV file to save results")
+    # args = parser.parse_args()
+
+    # run_sweep(args.sg, args.fstart, args.fstop, n_points=args.npoints, channel=args.channel, output_file=args.outfile)
+    device = SMC100A("USB::0x0AAD::0x006E::102502::INSTR")
+    device.set_freq("1 MHz")
+    device.set_power("0dBm")
+    device.rf_on()
+    scope = DigilentScope()
+    scope.configure_channel(v_range = 0.5)
+    scope.set_timebase(sample_rate = 1e-3, buffer_size = 1000)
+    trace = scope.get_waveform(channel = 0, timeout=10)
+    print(scope.get_peak_to_peak())
+    plt.plot(trace)
+    plt.show()
