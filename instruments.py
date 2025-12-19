@@ -36,13 +36,14 @@ class SMC100A:
 
 # -------------------- Oscilloscope --------------------
 class DigilentScope:
-    def __init__(self, channels=[1]):
+    def __init__(self, channels=[1], sample_rate = 20e6, buffer_size = 8192):
         self.channels = [ch - 1 for ch in channels]  # 0-indexed
         self.device = dwf.Device()
         self.device.open()
         self.ai = self.device.analog_input
-        self.sample_rate = None
-        self.buffer_size = None
+        self.sample_rate = sample_rate
+        self.buffer_size = buffer_size
+
 
         for idx in self.channels:
             ch = self.ai[idx]
@@ -57,11 +58,7 @@ class DigilentScope:
         ch.range = v_range
         ch.offset = offset
 
-    def set_timebase(self, sample_rate, buffer_size):
-        self.sample_rate = sample_rate
-        self.buffer_size = buffer_size
-        self.ai.record_length = buffer_size
-        self.ai.sampling_rate = sample_rate
+
 
     def _wait_for_completion(self, timeout=2.0):
         t0 = time.time()
@@ -73,12 +70,10 @@ class DigilentScope:
                 raise TimeoutError("Acquisition did not complete in time")
             time.sleep(0.001)
 
-    def get_waveform(self, channel=1, timeout=2.0):
+    def get_waveform(self,channel = 1, timeout=2.0):
         idx = channel - 1
-        if self.sample_rate is None or self.buffer_size is None:
-            raise ValueError("Sample rate and buffer size must be set before acquisition")
-        self.ai.trigger_source = "none"
-        self.ai.single(configure=True, start=True)
+        self.ai.setup_edge_trigger(mode="auto", channel=channel, slope="rising", level=0.1, hysteresis=0.01)
+        self.ai.single(configure=True, start=True, buffer_size = self.buffer_size, sample_rate = self.sample_rate)
         self._wait_for_completion(timeout=timeout)
         samples = np.array(self.ai[idx].get_data())
         return samples
@@ -95,6 +90,58 @@ class DigilentScope:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+
+
+VALID_MANTISSAS = np.array([1, 2, 5])
+
+def quantize_sample_rate(fs_ideal, fs_min=0.1, fs_max=100e6):
+    """
+    Snap fs_ideal to nearest valid Digilent sample rate
+    (1,2,5 × 10^n)
+    """
+    fs_ideal = np.clip(fs_ideal, fs_min, fs_max)
+
+    decade = np.floor(np.log10(fs_ideal))
+    candidates = []
+
+    for d in [decade - 1, decade, decade + 1]:
+        for m in VALID_MANTISSAS:
+            candidates.append(m * 10**d)
+
+    candidates = np.array(candidates)
+    candidates = candidates[(candidates >= fs_min) & (candidates <= fs_max)]
+
+    return candidates[np.argmin(np.abs(candidates - fs_ideal))]
+VALID_BUFFERS = np.array([2**n for n in range(5, 15)])  # 32 → 16384
+
+def select_buffer_size(fs, f_signal, n_cycles=10):
+    """
+    Pick the smallest power-of-two buffer that captures
+    at least n_cycles of the signal
+    """
+    required = fs * (n_cycles / f_signal)
+
+    for buf in VALID_BUFFERS:
+        if buf >= required:
+            return buf
+
+    return VALID_BUFFERS[-1]  # clamp to max
+
+def choose_timebase(f_signal, n_cycles=10):
+    """
+    Returns (sample_rate, buffer_size)
+    respecting Digilent constraints
+    """
+    # Ideal continuous math
+    display_time = n_cycles / f_signal
+    fs_ideal = 5000 / display_time
+
+    fs = quantize_sample_rate(fs_ideal)
+    buf = select_buffer_size(fs, f_signal, n_cycles)
+
+    return fs, buf
+
 
 
 # -------------------- Sweep Script --------------------
@@ -114,12 +161,8 @@ def run_sweep(sg_resource, f_start, f_stop, n_points=50, channel=1, output_file=
 
 
             # Timebase: capture ~10 periods on 5000 points
-            period = 1.0 / f
-            n_cycles = 10
-            display_time = period * n_cycles
-            buffer_size = 5000
-            sample_rate = buffer_size / display_time
-            scope.set_timebase(sample_rate=sample_rate, buffer_size=buffer_size)
+            fs, buf = choose_timebase(f, n_cycles=10)
+            scope.set_timebase(sample_rate=fs, buffer_size=buf)
 
             # Small delay to let instruments settle
             time.sleep(0.01)
@@ -167,12 +210,13 @@ if __name__ == "__main__":
 
     # run_sweep(args.sg, args.fstart, args.fstop, n_points=args.npoints, channel=args.channel, output_file=args.outfile)
     device = SMC100A("USB::0x0AAD::0x006E::102502::INSTR")
-    device.set_freq("1 MHz")
+    f = "10000 kHz"
+    device.set_freq(f)
     device.set_power("0dBm")
     device.rf_on()
-    scope = DigilentScope()
-    scope.configure_channel(v_range = 0.5)
-    scope.set_timebase(sample_rate = 1e-3, buffer_size = 1000)
+    fs,buf = choose_timebase(10000e3)
+    scope = DigilentScope(sample_rate=fs, buffer_size = buf)
+    scope.configure_channel(v_range = 0.1)
     trace = scope.get_waveform(channel = 0, timeout=10)
     print(scope.get_peak_to_peak())
     plt.plot(trace)
