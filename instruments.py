@@ -14,8 +14,8 @@ import dwfpy as dwf
 class SMC100A:
     """Simple R&S SMC100A wrapper using SCPI over VISA."""
 
-    def __init__(self, resource: str):
-        self.rm = pyvisa.ResourceManager()
+    def __init__(self, resource: str, visa_backend: str = ""):
+        self.rm = pyvisa.ResourceManager(visa_backend)
         self.inst = self.rm.open_resource(resource)
         self.inst.timeout = 10_000
         self.inst.write_termination = "\n"
@@ -43,6 +43,10 @@ class SMC100A:
         cmd = f"{dbm}" if isinstance(dbm, (int, float)) else str(dbm)
         self.inst.write(f"SOUR:POW:POW {cmd}")
 
+    def get_power(self) -> float:
+        """Read back the current output power level in dBm."""
+        return float(self.inst.query("SOUR:POW:POW?"))
+
     def rf_on(self) -> None:
         self.inst.write("OUTP ON")
 
@@ -54,6 +58,70 @@ class SMC100A:
             self.rf_off()
         finally:
             self.inst.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
+# -------------------- DMM --------------------
+class DMM6500:
+    """Keithley DMM6500 wrapper using SCPI over VISA.
+
+    Supports DC/AC voltage and DC/AC current measurements.
+    Default function is DC voltage; call ``configure()`` to change.
+    """
+
+    FUNCTIONS = {
+        "volt:dc": "VOLT:DC",
+        "volt:ac": "VOLT:AC",
+        "curr:dc": "CURR:DC",
+        "curr:ac": "CURR:AC",
+        "res": "RES",
+    }
+
+    def __init__(self, resource: str, function: str = "volt:dc", visa_backend: str = ""):
+        self.rm = pyvisa.ResourceManager(visa_backend)
+        self.inst = self.rm.open_resource(resource)
+        self.inst.timeout = 10_000
+        self.inst.write_termination = "\n"
+        self.inst.read_termination = "\n"
+        try:
+            idn = self.inst.query("*IDN?")
+        except Exception:
+            idn = "<IDN? failed>"
+        print("Connected to:", idn)
+        self.configure(function)
+
+    def configure(self, function: str = "volt:dc", auto_range: bool = True) -> None:
+        """Select measurement function and optionally enable auto-range."""
+        key = function.lower()
+        if key not in self.FUNCTIONS:
+            raise ValueError(f"Unknown function '{function}'. Choose from: {list(self.FUNCTIONS)}")
+        scpi_func = self.FUNCTIONS[key]
+        self.inst.write(f':SENS:FUNC "{scpi_func}"')
+        if auto_range:
+            self.inst.write(f":SENS:{scpi_func}:RANG:AUTO ON")
+        self._function = scpi_func
+
+    def measure(self) -> float:
+        """Trigger a single reading and return the result."""
+        return float(self.inst.query(":READ?"))
+
+    def measure_voltage_dc(self) -> float:
+        """Convenience: switch to DC voltage and read once."""
+        self.configure("volt:dc")
+        return self.measure()
+
+    def measure_voltage_ac(self) -> float:
+        """Convenience: switch to AC voltage and read once."""
+        self.configure("volt:ac")
+        return self.measure()
+
+    def close(self) -> None:
+        self.inst.close()
 
     def __enter__(self):
         return self
@@ -273,25 +341,130 @@ def run_sweep(
     plt.show()
 
 
+# -------------------- Power-level scan --------------------
+def run_power_scan(
+    sg_resource: str,
+    dmm_resource: str,
+    freq_hz: float,
+    p_start: float,
+    p_stop: float,
+    n_points: int = 30,
+    settle_s: float = 0.1,
+    dmm_function: str = "volt:dc",
+    n_avg: int = 1,
+    output_file: str = "power_scan.csv",
+) -> None:
+    """Sweep SMC100A output level in dBm and record DMM6500 voltage at each step.
+
+    Parameters
+    ----------
+    sg_resource:   VISA resource string for the SMC100A.
+    dmm_resource:  VISA resource string for the Keithley DMM6500.
+    freq_hz:       Fixed RF output frequency in Hz during the scan.
+    p_start:       Start output power in dBm (inclusive).
+    p_stop:        Stop output power in dBm (inclusive).
+    n_points:      Number of linearly-spaced power steps.
+    settle_s:      Wait time (seconds) after setting each power level.
+    dmm_function:  DMM measurement function ('volt:dc', 'volt:ac', etc.).
+    n_avg:         Number of DMM readings to average per power step.
+    output_file:   CSV path for results.
+    """
+    powers_dbm = np.linspace(p_start, p_stop, n_points)
+    actual_powers: list[float] = []
+    voltages: list[float] = []
+
+    with SMC100A(sg_resource) as sg, DMM6500(dmm_resource, function=dmm_function) as dmm:
+        sg.set_freq(freq_hz)
+        sg.rf_on()
+        try:
+            for p in powers_dbm:
+                sg.set_power(p)
+                time.sleep(settle_s)
+
+                actual_p = sg.get_power()
+                actual_powers.append(actual_p)
+
+                readings = [dmm.measure() for _ in range(n_avg)]
+                v = float(np.mean(readings))
+                voltages.append(v)
+
+                print(f"Set: {p:+.2f} dBm  Actual: {actual_p:+.2f} dBm  V: {v:.6g}")
+        finally:
+            sg.rf_off()
+
+    data = np.column_stack((powers_dbm, actual_powers, voltages))
+    np.savetxt(
+        output_file,
+        data,
+        delimiter=",",
+        header="SetPower(dBm),ActualPower(dBm),Voltage(V)",
+        comments="",
+    )
+    print(f"Data saved to {output_file}")
+
+    fig, ax1 = plt.subplots()
+    ax1.plot(actual_powers, voltages, marker="o", color="tab:blue")
+    ax1.set_xlabel("RF output power [dBm]")
+    ax1.set_ylabel("Measured voltage [V]", color="tab:blue")
+    ax1.tick_params(axis="y", labelcolor="tab:blue")
+    ax1.grid(True)
+    plt.title(f"Power scan @ {freq_hz/1e6:.3f} MHz")
+    plt.tight_layout()
+    plt.show()
+
+
 # -------------------- Command-line interface --------------------
 if __name__ == "__main__":
 
-    parser = argparse.ArgumentParser(description="Frequency sweep using SMC100A + Digilent scope")
-    parser.add_argument("--sg", type=str, required=True, help="Signal generator VISA resource string")
-    parser.add_argument("--fstart", type=float, default=9e3, help="Start frequency (Hz)")
-    parser.add_argument("--fstop", type=float, default=100e6, help="Stop frequency (Hz)")
-    parser.add_argument("--npoints", type=int, default=50, help="Number of points in sweep")
-    parser.add_argument("--channel", type=int, default=1, help="Scope channel to measure")
-    parser.add_argument("--outfile", type=str, default="sweep.csv", help="CSV file to save results")
-    parser.add_argument("--ncycles", type=int, default=10, help="Number of signal cycles to capture per point")
+    parser = argparse.ArgumentParser(description="Instrument control: SMC100A + Digilent scope / Keithley DMM6500")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # ---- sub-command: sweep (frequency sweep, SMC100A + Digilent scope) ----
+    p_sweep = subparsers.add_parser("sweep", help="Log-spaced frequency sweep with Digilent scope")
+    p_sweep.add_argument("--sg", type=str, required=True, help="SMC100A VISA resource string")
+    p_sweep.add_argument("--fstart", type=float, default=9e3, help="Start frequency (Hz)")
+    p_sweep.add_argument("--fstop", type=float, default=100e6, help="Stop frequency (Hz)")
+    p_sweep.add_argument("--npoints", type=int, default=50, help="Number of frequency points")
+    p_sweep.add_argument("--channel", type=int, default=1, help="Scope channel to measure")
+    p_sweep.add_argument("--outfile", type=str, default="sweep.csv", help="CSV output file")
+    p_sweep.add_argument("--ncycles", type=int, default=10, help="Signal cycles to capture per point")
+
+    # ---- sub-command: power-scan (dBm scan, SMC100A + Keithley DMM6500) ----
+    p_pscan = subparsers.add_parser("power-scan", help="Sweep SMC100A output level and record DMM6500 voltage")
+    p_pscan.add_argument("--sg", type=str, required=True, help="SMC100A VISA resource string")
+    p_pscan.add_argument("--dmm", type=str, required=True, help="DMM6500 VISA resource string")
+    p_pscan.add_argument("--freq", type=float, default=100e6, help="Fixed RF frequency (Hz)")
+    p_pscan.add_argument("--pstart", type=float, default=-20.0, help="Start power (dBm)")
+    p_pscan.add_argument("--pstop", type=float, default=10.0, help="Stop power (dBm)")
+    p_pscan.add_argument("--npoints", type=int, default=30, help="Number of power steps")
+    p_pscan.add_argument("--settle", type=float, default=0.1, help="Settle time per step (s)")
+    p_pscan.add_argument("--func", type=str, default="volt:dc",
+                         choices=list(DMM6500.FUNCTIONS), help="DMM measurement function")
+    p_pscan.add_argument("--navg", type=int, default=1, help="DMM readings to average per step")
+    p_pscan.add_argument("--outfile", type=str, default="power_scan.csv", help="CSV output file")
+
     args = parser.parse_args()
 
-    run_sweep(
-        args.sg,
-        args.fstart,
-        args.fstop,
-        n_points=args.npoints,
-        channel=args.channel,
-        output_file=args.outfile,
-        n_cycles=args.ncycles,
-    )
+    if args.command == "sweep":
+        run_sweep(
+            args.sg,
+            args.fstart,
+            args.fstop,
+            n_points=args.npoints,
+            channel=args.channel,
+            output_file=args.outfile,
+            n_cycles=args.ncycles,
+        )
+    elif args.command == "power-scan":
+        run_power_scan(
+            sg_resource=args.sg,
+            dmm_resource=args.dmm,
+            freq_hz=args.freq,
+            p_start=args.pstart,
+            p_stop=args.pstop,
+            n_points=args.npoints,
+            settle_s=args.settle,
+            dmm_function=args.func,
+            n_avg=args.navg,
+            output_file=args.outfile,
+        )
