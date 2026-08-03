@@ -222,6 +222,123 @@ class DigilentScope:
         self.close()
 
 
+# -------------------- Tektronix Oscilloscope --------------------
+class TBS1072B:
+    """Tektronix TBS1072B wrapper (SCPI over VISA) for Vpp measurements."""
+
+    def __init__(
+        self,
+        resource: str,
+        channel: int = 1,
+        timeout_ms: int = 10_000,
+        visa_backend: str = "",
+    ):
+        self.rm = pyvisa.ResourceManager(visa_backend)
+        self.inst = self.rm.open_resource(resource)
+        self.inst.timeout = timeout_ms
+        self.inst.write_termination = "\n"
+        self.inst.read_termination = "\n"
+        try:
+            idn = self.inst.query("*IDN?")
+        except Exception:
+            idn = "<IDN? failed>"
+        print("Connected to:", idn)
+        self.set_channel(channel)
+
+    @staticmethod
+    def _validate_channel(channel: int) -> int:
+        ch = int(channel)
+        if ch not in (1, 2):
+            raise ValueError("TBS1072B channel must be 1 or 2")
+        return ch
+
+    def _query_float(self, cmd: str) -> float:
+        raw = self.inst.query(cmd).strip()
+        # Some scopes return extras like "9.87E-1 V" or CSV-like tokens.
+        token = raw.split(",")[0].split(" ")[0]
+        return float(token)
+
+    def set_channel(self, channel: int) -> None:
+        """Set the active measurement channel (CH1/CH2)."""
+        self.channel = self._validate_channel(channel)
+        self.inst.write(f"DATA:SOURCE CH{self.channel}")
+
+    def set_timebase(self, seconds_per_div: float) -> None:
+        """Set horizontal scale in seconds/division."""
+        if seconds_per_div <= 0:
+            raise ValueError("seconds_per_div must be > 0")
+        self.inst.write(f"HORizontal:MAIn:SCAle {seconds_per_div}")
+
+    def set_vertical_scale(self, volts_per_div: float, channel: int | None = None) -> None:
+        """Set vertical scale in volts/division for CH1/CH2."""
+        if volts_per_div <= 0:
+            raise ValueError("volts_per_div must be > 0")
+        if channel is not None:
+            self.set_channel(channel)
+        self.inst.write(f"CH{self.channel}:SCAle {volts_per_div}")
+
+    def set_averaging(self, num_averages: int = 64) -> int:
+        """Enable/disable acquisition averaging and return applied average count.
+
+        TBS scopes typically support powers of two (2..512). A value <= 1 disables
+        averaging (sample mode).
+        """
+        n = int(num_averages)
+        if n <= 1:
+            self.inst.write("ACQuire:MODe SAMple")
+            return 1
+
+        # Common supported counts on TBS family.
+        allowed = np.array([2, 4, 8, 16, 32, 64, 128, 256, 512], dtype=int)
+        n_applied = int(allowed[np.argmin(np.abs(allowed - n))])
+        self.inst.write("ACQuire:MODe AVErage")
+        self.inst.write(f"ACQuire:NUMAVg {n_applied}")
+        return n_applied
+
+    def set_timebase_for_frequency(self, frequency_hz: float, cycles_on_screen: float = 8.0) -> float:
+        """Set timebase so about `cycles_on_screen` periods span all 10 divisions.
+
+        Returns the requested seconds/division value.
+        """
+        if frequency_hz <= 0:
+            raise ValueError("frequency_hz must be > 0")
+        if cycles_on_screen <= 0:
+            raise ValueError("cycles_on_screen must be > 0")
+
+        seconds_per_div = cycles_on_screen / (10.0 * float(frequency_hz))
+        self.set_timebase(seconds_per_div)
+        return seconds_per_div
+
+    def measure_vpp(self, channel: int | None = None) -> float:
+        """Measure peak-to-peak voltage (Vpp) on the selected channel."""
+        if channel is not None:
+            self.set_channel(channel)
+
+        # Prefer immediate measurement path.
+        # Tek variants differ slightly in accepted source command syntax.
+        self.inst.write("MEASUrement:IMMed:TYPE PK2PK")
+        try:
+            self.inst.write(f"MEASUrement:IMMed:SOUrce CH{self.channel}")
+        except Exception:
+            self.inst.write(f"MEASUrement:IMMed:SOUrce1 CH{self.channel}")
+
+        for cmd in ("MEASUrement:IMMed:VALue?", "MEASUrement:MEAS1:VALue?"):
+            try:
+                return self._query_float(cmd)
+            except Exception:
+                continue
+        raise RuntimeError("Failed to read Vpp from TBS1072B with known SCPI queries")
+
+    def close(self) -> None:
+        self.inst.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
 VALID_MANTISSAS = np.array([1, 2, 5])
 
 
